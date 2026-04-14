@@ -1,69 +1,68 @@
 import streamlit as st
 import pandas as pd
-import pickle
 import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 import pulp
 
-st.set_page_config(page_title="Smart Expense Analyzer", layout="wide")
+st.set_page_config(page_title="Expense Dashboard", layout="wide")
 
-st.title("💰 Smart Expense Categorization & Savings Optimizer")
+st.title("💰 Smart Expense Analyzer & Savings Optimizer")
 
 # ===============================
 # SIDEBAR INPUTS
 # ===============================
-st.sidebar.header("User Inputs")
+st.sidebar.header("⚙️ Controls")
 
-uploaded_file = st.sidebar.file_uploader("Upload Bank Statement (CSV)", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload Bank Statement", type=["csv"])
 
-user_name = st.sidebar.text_input("Account Holder Name (for Self Transfer)")
-landlord_name = st.sidebar.text_input("Landlord Name (for Rent)")
+user_name = st.sidebar.text_input("Account Holder Name (Self Transfer)")
+landlord_name = st.sidebar.text_input("Landlord Name (Rent)")
 
 savings_target = st.sidebar.number_input("Monthly Savings Target (₹)", min_value=0, value=2000)
 
 # ===============================
-# LOAD TRAIN DATA (MODEL)
+# MODEL TRAINING
 # ===============================
 @st.cache_resource
 def train_model():
-    train_df = pd.read_csv("financial_transaction_train1.csv")
+    df = pd.read_csv("financial_transaction_train1.csv")
 
-    X_train = train_df["Transaction_Text"].astype(str)
-    y_train = train_df["Label"].astype(str)
+    X = df["Transaction_Text"].astype(str)
+    y = df["Label"].astype(str)
 
-    pipeline = Pipeline([
-        ('vectorizer', TfidfVectorizer(stop_words='english', max_features=2000)),
-        ('classifier', RandomForestClassifier(n_estimators=100, random_state=42))
+    model = Pipeline([
+        ('tfidf', TfidfVectorizer(stop_words='english', max_features=2000)),
+        ('rf', RandomForestClassifier(n_estimators=100, random_state=42))
     ])
 
-    pipeline.fit(X_train, y_train)
-    return pipeline
+    model.fit(X, y)
+    return model
 
 model = train_model()
 
 # ===============================
-# PROCESS USER FILE
+# MAIN LOGIC
 # ===============================
 if uploaded_file:
+
     df = pd.read_csv(uploaded_file)
 
-    st.subheader("📄 Raw Data Preview")
+    st.subheader("📄 Raw Data")
     st.dataframe(df.head())
 
     # Clean amounts
     df['Withdrawal Amt.'] = df['Withdrawal Amt.'].fillna(0)
     df['Deposit Amt.'] = df['Deposit Amt.'].fillna(0)
 
-    # Standardize
-    def get_amount_type(row):
+    def get_amount(row):
         if row['Deposit Amt.'] > 0:
-            return row['Deposit Amt.'], 'Credit'
+            return row['Deposit Amt.'], "Credit"
         else:
-            return row['Withdrawal Amt.'], 'Debit'
+            return row['Withdrawal Amt.'], "Debit"
 
-    df[['Amount', 'Type']] = df.apply(get_amount_type, axis=1, result_type='expand')
+    df[['Amount', 'Type']] = df.apply(get_amount, axis=1, result_type='expand')
 
     # ML Prediction
     df['Category'] = model.predict(df['Narration'].astype(str))
@@ -75,18 +74,44 @@ if uploaded_file:
     if landlord_name:
         df.loc[df['Narration'].str.upper().str.contains(landlord_name.upper(), na=False), 'Category'] = 'Rent'
 
-    # Filter Debit
+    # Only expenses
     expenses = df[df['Type'] == 'Debit'].copy()
 
-    st.subheader("🤖 Categorized Expenses")
-    st.dataframe(expenses[['Date', 'Narration', 'Amount', 'Category']])
+    # ===============================
+    # DATE + MONTH
+    # ===============================
+    expenses['Date'] = pd.to_datetime(expenses['Date'], errors='coerce', dayfirst=True)
+    expenses['Month'] = expenses['Date'].dt.strftime('%b %Y')
+
+    # ===============================
+    # MONTH FILTER
+    # ===============================
+    st.sidebar.subheader("📅 Filter by Month")
+
+    all_months = sorted(expenses['Month'].dropna().unique())
+
+    selected_months = st.sidebar.multiselect(
+        "Select Month(s)",
+        options=all_months,
+        default=all_months
+    )
+
+    # Apply filter
+    if selected_months:
+        filtered_expenses = expenses[expenses['Month'].isin(selected_months)]
+    else:
+        filtered_expenses = expenses.copy()
+
+    st.subheader("📊 Filtered Expenses")
+    st.write(f"Showing data for: {', '.join(selected_months)}")
+    st.dataframe(filtered_expenses[['Date', 'Narration', 'Amount', 'Category']])
 
     # ===============================
     # DASHBOARD
     # ===============================
-    st.subheader("📊 Expense Breakdown")
+    st.subheader("📈 Expense Dashboard")
 
-    category_summary = expenses.groupby('Category')['Amount'].sum().sort_values(ascending=False)
+    category_summary = filtered_expenses.groupby('Category')['Amount'].sum().sort_values(ascending=False)
 
     col1, col2 = st.columns(2)
 
@@ -104,25 +129,18 @@ if uploaded_file:
     # ===============================
     st.subheader("🎯 Savings Optimization")
 
-    # Monthly avg
-    expenses['Date'] = pd.to_datetime(expenses['Date'], errors='coerce', dayfirst=True)
-    expenses['Month'] = expenses['Date'].dt.to_period('M')
-
-    num_months = expenses['Month'].nunique()
+    num_months = filtered_expenses['Month'].nunique()
     if num_months == 0:
         num_months = 1
 
-    monthly_avg = expenses.groupby('Category')['Amount'].sum() / num_months
+    monthly_avg = filtered_expenses.groupby('Category')['Amount'].sum() / num_months
 
     categories = monthly_avg.index.tolist()
 
     prob = pulp.LpProblem("Savings", pulp.LpMinimize)
     cuts = pulp.LpVariable.dicts("Cut", categories, lowBound=0)
 
-    # Objective
     prob += pulp.lpSum([cuts[c] for c in categories])
-
-    # Constraint
     prob += pulp.lpSum([cuts[c] for c in categories]) == savings_target
 
     for c in categories:
@@ -132,15 +150,15 @@ if uploaded_file:
 
     results = []
     for c in categories:
-        if cuts[c].value() > 0:
+        if cuts[c].value() and cuts[c].value() > 0:
             results.append({
                 "Category": c,
-                "Current Avg": monthly_avg[c],
-                "Cut": cuts[c].value(),
-                "New Budget": monthly_avg[c] - cuts[c].value()
+                "Current Avg": round(monthly_avg[c], 2),
+                "Suggested Cut": round(cuts[c].value(), 2),
+                "New Budget": round(monthly_avg[c] - cuts[c].value(), 2)
             })
 
     st.dataframe(pd.DataFrame(results))
 
 else:
-    st.info("👆 Upload your bank statement to get started")	
+    st.info("👆 Upload your bank statement to begin")
